@@ -1,0 +1,14 @@
+.venv/
+.venv.bak/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.pytest_cache/
+*.log
+start.sh
+start.bat
+start_mes_wsl.bat
+Dockerfile
+.dockerignore
