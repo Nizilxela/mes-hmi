@@ -171,6 +171,7 @@ class Conn(BaseModel):
 
 class RawCmd(Conn):
     command: str
+    multiline: bool = False
 
 
 class SetNumCmd(Conn):
@@ -193,6 +194,7 @@ class ExportConfig(BaseModel):
     port: int = DEFAULT_PORT
     rate_ms: int = 1000
     write_log: list[str] = []
+    custom_commands: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +220,7 @@ async def _run(conn: Conn, command: str, multiline: bool = False) -> dict:
 @app.post("/api/mes/raw")
 async def mes_raw(cmd: RawCmd):
     """Произвольная команда (для отладки)."""
-    return await _run(cmd, cmd.command)
+    return await _run(cmd, cmd.command, multiline=cmd.multiline)
 
 
 @app.post("/api/mes/get_recipes")
@@ -481,6 +483,8 @@ def _render_spa(export_cfg: Optional[dict] = None) -> str:
   ul.recipes { list-style:none; padding-left:0; margin:0; }
   ul.recipes li { padding:4px 6px; border-bottom:1px solid #eee; }
   ul.recipes li.active { background:#E3F2FD; font-weight:bold; }
+  .custom-command { border:1px solid #ddd; border-radius:6px; padding:10px; margin:8px 0; }
+  .custom-command output { display:block; white-space:pre-wrap; font-family:monospace; margin-top:6px; color:#333; }
 </style>
 </head>
 <body>
@@ -504,6 +508,19 @@ def _render_spa(export_cfg: Optional[dict] = None) -> str:
   <div class="topbtns">
     <button onclick="exportConfig()">Экспорт конфигурации HMI</button>
   </div>
+</div>
+
+<div class="panel">
+  <h3 style="margin-top:0">Мои команды</h3>
+  <div class="hint">Команды сохраняются в этом браузере. Для команды записи используйте {value}, чтобы подставить значение из поля ввода. Например: SETLNUM;{value}</div>
+  <div class="row">
+    <label>Название <input id="custom-name" type="text" placeholder="Прочитать температуру"></label>
+    <label>Тип <select id="custom-mode"><option value="read">Чтение</option><option value="write">Запись</option></select></label>
+    <label>Команда <input id="custom-command" type="text" placeholder="GETTEMP" style="min-width:220px"></label>
+    <label><input id="custom-multiline" type="checkbox"> многострочный ответ (до done)</label>
+    <button onclick="addCustomCommand()" class="primary">Добавить команду</button>
+  </div>
+  <div id="custom-commands"></div>
 </div>
 
 <div class="panel">
@@ -594,6 +611,7 @@ let ws = null;
 let userStopped = true;
 let selectedLeft = null;
 let selectedRight = null;
+let customCommands = [];
 
 function logLine(s) {
   const el = document.getElementById("log");
@@ -753,13 +771,62 @@ async function cmdRaw() {
   await api("/api/mes/raw", {command});
 }
 
+/* ====== Пользовательские команды ====== */
+function saveCustomCommands() {
+  try { localStorage.setItem("mes.customCommands", JSON.stringify(customCommands)); } catch(e) {}
+}
+function addCustomCommand() {
+  const name = document.getElementById("custom-name").value.trim();
+  const command = document.getElementById("custom-command").value.trim();
+  const mode = document.getElementById("custom-mode").value;
+  if (!name || !command) { alert("Укажите название и команду"); return; }
+  customCommands.push({id: String(Date.now()) + Math.random().toString(16).slice(2), name, command, mode,
+    multiline: document.getElementById("custom-multiline").checked});
+  saveCustomCommands(); renderCustomCommands();
+  document.getElementById("custom-name").value = "";
+  document.getElementById("custom-command").value = "";
+}
+function renderCustomCommands() {
+  const root = document.getElementById("custom-commands");
+  root.replaceChildren();
+  if (!customCommands.length) { root.innerText = "Пока нет добавленных команд."; return; }
+  customCommands.forEach(item => {
+    const card = document.createElement("div"); card.className = "custom-command";
+    const title = document.createElement("b"); title.innerText = item.name + " — " + (item.mode === "read" ? "чтение" : "запись"); card.appendChild(title);
+    const code = document.createElement("div"); code.innerText = item.command; card.appendChild(code);
+    if (item.mode === "write" && item.command.includes("{value}")) {
+      const input = document.createElement("input"); input.type = "text"; input.placeholder = "Значение"; input.id = "custom-value-" + item.id;
+      card.appendChild(input);
+    }
+    const run = document.createElement("button"); run.innerText = item.mode === "read" ? "Прочитать" : "Записать";
+    run.onclick = () => runCustomCommand(item); card.appendChild(run);
+    const remove = document.createElement("button"); remove.innerText = "Удалить"; remove.onclick = () => {
+      customCommands = customCommands.filter(c => c.id !== item.id); saveCustomCommands(); renderCustomCommands();
+    }; card.appendChild(remove);
+    const output = document.createElement("output"); output.id = "custom-output-" + item.id; card.appendChild(output);
+    root.appendChild(card);
+  });
+}
+async function runCustomCommand(item) {
+  let command = item.command;
+  if (item.mode === "write" && command.includes("{value}")) {
+    const input = document.getElementById("custom-value-" + item.id);
+    if (!input || !input.value.trim()) { alert("Введите значение для записи"); return; }
+    command = command.replaceAll("{value}", input.value.trim());
+  }
+  const result = await api("/api/mes/raw", {command, multiline: !!item.multiline});
+  const output = document.getElementById("custom-output-" + item.id);
+  if (output) output.innerText = result.status === "ok" ? result.response : "Ошибка: " + (result.message || "не удалось выполнить команду");
+}
+
 /* ====== Экспорт ====== */
 async function exportConfig() {
   const {host, port} = conn();
   const cfg = {
     api_base: API_BASE, host, port,
     rate_ms: parseInt(document.getElementById("polling-rate").value) || 1000,
-    write_log: []
+    write_log: [],
+    custom_commands: customCommands
   };
   const r = await fetch(API_BASE + "/api/mes/export", {
     method: "POST", headers: {"Content-Type":"application/json"},
@@ -779,13 +846,16 @@ async function exportConfig() {
     if (EMBEDDED.host) document.getElementById("host").value = EMBEDDED.host;
     if (EMBEDDED.port) document.getElementById("port").value = EMBEDDED.port;
     if (EMBEDDED.rate_ms) document.getElementById("polling-rate").value = EMBEDDED.rate_ms;
+    if (Array.isArray(EMBEDDED.custom_commands)) customCommands = EMBEDDED.custom_commands;
   } else {
     try {
       const h = localStorage.getItem("mes.host"); if (h) document.getElementById("host").value = h;
       const p = localStorage.getItem("mes.port"); if (p) document.getElementById("port").value = p;
       const r = localStorage.getItem("mes.rate"); if (r) document.getElementById("polling-rate").value = r;
+      const commands = localStorage.getItem("mes.customCommands"); if (commands) customCommands = JSON.parse(commands);
     } catch(e){}
   }
+  renderCustomCommands();
   // сохраняем при изменениях
   ["host","port","polling-rate"].forEach(id => {
     document.getElementById(id).addEventListener("change", () => {
